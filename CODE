@@ -1,0 +1,164 @@
+#PREP AND DATA CLEANING
+
+#Libraries
+install.packages("spgwr")
+library(spgwr)
+library(spatstat)
+library(tmap)
+library(gstat)
+library(sf)
+library(raster)
+library(rgdal)
+library(e1071)
+library(spdep)
+
+
+#Reading in air pollution dataset and reproject to NAD83 UTM Zone 10N
+pollution <- readOGR(".", "Pm25Sample") #Read in point data
+pollution <- spTransform(pollution, CRS("+init=epsg:26910"))
+
+
+#Reading in dissemination tract and income data
+#Read in census income data:
+income <- read.csv("Income.csv")  
+#Select only ID and Income columns:
+colnames(income) <- c("DAUID", "Income") 
+#Read in dissemination tract shapefile:
+census.tracts <- readOGR(".", "BC_DA") 
+#Merge income and dissemination data:
+income.tracts <- merge(census.tracts,income, by = "DAUID") 
+#Determine the number of columns in the dataframe:
+nrow(income.tracts)
+#Remove NA values (bringing # from 7582 to 3363):
+income.tracts <- income.tracts[!is.na(income.tracts$Income),]
+#Reproject the data:
+income.tracts <- spTransform(income.tracts, CRS("+init=epsg:26910"))
+
+#DESCRIPTIVE STATS
+meanincome <- mean(income.tracts$Income, na.rm = TRUE) #Use na.rm = TRUE to ignore NA values in calculation
+meanincome
+
+
+
+#Create choropleth map of income
+map_Income <- tm_shape(income.tracts) +
+  tm_polygons(col = "Income",
+              title = "Median Income ($)",
+              style = "jenks",
+              palette = "viridis", n = 5,
+              border.col = "white", border.alpha = 0.3) +
+  tm_shape(pollution) +
+  tm_symbols(col = "black", size = 0.05, border.col = "black") +
+  tm_legend(legend.position = c("LEFT", "BOTTOM"))+
+  tm_layout(panel.labels = "Mean Income Levels Across \nMetro Vancouver Dissemination Areas (2016)", panel.label.height = 4) +
+  tm_scale_bar(c(5,10), position = "center", "bottom") +
+  tm_compass(type = "arrow", position = c("right", "top"))
+
+map_Income
+
+
+
+#Create a grid called grd to use in your interpolation
+# Create an empty grid where n is the total number of cells
+grd <- as.data.frame(spsample(pollution, "regular", n=5000))
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+# Create SpatialPixel object:
+gridded(grd)     <- TRUE  
+# Create SpatialGrid object:
+fullgrid(grd)    <- TRUE  
+#Reproject the grid:
+proj4string(grd) <- proj4string(income.tracts)
+
+
+
+
+
+
+
+
+
+
+#NND analysis to test sample
+#####
+
+###NEAREST NEIGHBOUR PM25
+nearestNeighbour <- nndist(pollution$PM25)
+
+##Convert the nearestNeighbor object into a dataframe.
+nearestNeighbour=as.data.frame(as.numeric(nearestNeighbour))
+##Change the column name to "Distance"
+colnames(nearestNeighbour) = "Distance"
+
+sum.nnd.pm25 <- sum(nearestNeighbour$Distance)
+
+
+##Calculate the nearest neighbor statistic to test for a random spatial distribution.
+#mean nearest neighbour
+nnd.pm25 = sum.nnd.pm25/3451
+
+#mean nearest neighbour for random spatial distribution; 2880 for area
+
+pointDensity.pm25 <- 3451/2880 
+r.nnd.pm25 = 1/(2*(sqrt(pointDensity.pm25)))
+d.nnd.pm25 = 1.07453/(sqrt(pointDensity.pm25))
+R.pm25 = nnd.pm25/r.nnd.pm25
+SE.NND.pm25 <- 0.26136/sqrt(3451*pointDensity.pm25)
+z.pm25 = (nnd.pm25 - r.nnd.pm25)/SE.NND.pm25
+
+
+
+###Moran's I test for income
+
+#Queens Weight
+income.nb <- poly2nb(income.tracts)
+income.net <- nb2lines(income.nb, coords=coordinates(income.tracts))
+crs(income.net) <- crs(income.tracts)
+
+#make the weights matrix
+income.lw <- nb2listw(income.nb, zero.policy = TRUE, style = "W")
+print.listw(income.lw, zero.policy = TRUE)
+
+#Global test
+miINCOME <- moran.test(income.tracts$Income, income.lw, zero.policy = TRUE)
+miINCOME
+
+mIINCOME <- miINCOME$estimate[[1]]
+eIINCOME <- miINCOME$estimate[[2]]
+varINCOME <- miINCOME$estimate[[3]]
+
+zINCOME <- (mIINCOME-eIINCOME)/(sqrt(varINCOME))
+
+
+#Local test 
+lisa.test <- localmoran(income.tracts$Income, income.lw, zero.policy = TRUE)
+
+income.tracts$Ii <- lisa.test[,1]
+income.tracts$E.Ii<- lisa.test[,2]
+income.tracts$Var.Ii<- lisa.test[,3]
+income.tracts$Z.Ii<- lisa.test[,4]
+income.tracts$P<- lisa.test[,5]
+
+tmaptools::palette_explorer()
+
+#map p value for significance
+map_LISAP <- tm_shape(income.tracts) + tm_borders(col='white', lwd = 0.2) + 
+  tm_polygons(col = "P",
+              title = "P-Value for \nSignificance", 
+              breaks = c(0, 0.05, 1), 
+              palette = "Set1", n = 3) +
+  tm_layout(panel.labels = "Local Moran's I Significance for Income \nAcross Metro Vancouver (2016)", panel.label.height = 4) +
+  tm_legend(position = c("left", "bottom")) +
+  tm_scale_bar(breaks = c(0, 2, 4, 6, 8), position = "center", "bottom") +
+  tm_compass(type = "arrow", position = c("right", "top"))
+
+#map z value for direction of significance
+map_LISAZ <- tm_shape(income.tracts) + tm_borders(col='white', lwd = 0.2) + 
+  tm_polygons(col = "Z.Ii",
+              title = "Z-Value for \nDirectionality", 
+              breaks = c(-Inf, -1.96, 0, 1.96, Inf),
+              palette = "RdYlGn", n = 5) +
+  tm_layout(panel.labels = "Directionality of Local Moran's I Significance for \nIncome Across Metro Vancouver", panel.label.height = 4) +
+  tm_scale_bar(breaks = c(0, 2, 4, 6, 8), position = "center", "bottom") +
+  tm_legend(position = c("left", "bottom")) +
+  tm_compass(type = "arrow", position = c("right", "top"))
